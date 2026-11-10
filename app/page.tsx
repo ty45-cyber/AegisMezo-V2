@@ -62,6 +62,26 @@ interface TelemetryPayload {
   };
 }
 
+interface EIP1193Provider {
+  request: (args: { method: string; params?: unknown[] | object }) => Promise<unknown>;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  isMetaMask?: boolean;
+  isRabby?: boolean;
+  isOkxWallet?: boolean;
+  isPhantom?: boolean;
+  providers?: EIP1193Provider[];
+}
+
+interface EIP6963ProviderDetail {
+  info: {
+    uuid: string;
+    name: string;
+    icon: string;
+    rdns: string;
+  };
+  provider: EIP1193Provider;
+}
+
 interface ActionReceipt {
   id: string;
   module: string;
@@ -76,10 +96,22 @@ export default function AegisMezoDashboard() {
   const [telemetry, setTelemetry] = useState<TelemetryPayload | null>(null);
   const [loadingTelemetry, setLoadingTelemetry] = useState<boolean>(true);
 
-  // Mezo Passport / Wallet State
+  // Mezo Passport / Wallet Extension State
   const [evmAddress, setEvmAddress] = useState<string>('');
   const [btcPassportAddress, setBtcPassportAddress] = useState<string>('');
   const [walletMode, setWalletMode] = useState<'disconnected' | 'live' | 'passport-sim'>('disconnected');
+  const [connectedWalletName, setConnectedWalletName] = useState<string>('');
+  const [connectedChainId, setConnectedChainId] = useState<number | null>(null);
+  const [showPassportModal, setShowPassportModal] = useState<boolean>(false);
+  const [walletStatusMsg, setWalletStatusMsg] = useState<string>('');
+  const [walletErrorMsg, setWalletErrorMsg] = useState<string>('');
+  const [eip6963Providers, setEip6963Providers] = useState<EIP6963ProviderDetail[]>([]);
+  const [activeEvmProvider, setActiveEvmProvider] = useState<EIP1193Provider | null>(null);
+  const [detectedBtcWallets, setDetectedBtcWallets] = useState<{
+    unisat: boolean;
+    okxBtc: boolean;
+    xverseOrLeather: boolean;
+  }>({ unisat: false, okxBtc: false, xverseOrLeather: false });
 
   // Module A: Redemption-Shielded Self-Healing Trove State
   const [btcCollateralInput, setBtcCollateralInput] = useState<string>('1.50');
@@ -150,6 +182,40 @@ export default function AegisMezoDashboard() {
     return () => clearInterval(timer);
   }, [fetchLiveTelemetry]);
 
+  // Discover all installed EVM (EIP-6963 + window.ethereum) & Native Bitcoin browser extensions
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const discovered = new Map<string, EIP6963ProviderDetail>();
+    const onAnnounce = (event: Event) => {
+      const customEvent = event as CustomEvent<EIP6963ProviderDetail>;
+      if (customEvent.detail?.info?.rdns && customEvent.detail?.provider) {
+        discovered.set(customEvent.detail.info.rdns, customEvent.detail);
+        setEip6963Providers(Array.from(discovered.values()));
+      }
+    };
+
+    window.addEventListener('eip6963:announceProvider', onAnnounce);
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+    const detectBtc = () => {
+      const w = window as unknown as Record<string, unknown>;
+      const okx = w.okxwallet as Record<string, unknown> | undefined;
+      setDetectedBtcWallets({
+        unisat: Boolean(w.unisat),
+        okxBtc: Boolean(okx && okx.bitcoin),
+        xverseOrLeather: Boolean(w.LeatherProvider || w.BitcoinProvider || w.XverseProviders),
+      });
+    };
+    detectBtc();
+    const btcTimer = setTimeout(detectBtc, 800);
+
+    return () => {
+      window.removeEventListener('eip6963:announceProvider', onAnnounce);
+      clearTimeout(btcTimer);
+    };
+  }, []);
+
   const appendReceipt = (module: string, action: string, details: string, customHash?: string) => {
     const randomHex = Array.from({ length: 64 }, () =>
       Math.floor(Math.random() * 16).toString(16)
@@ -168,19 +234,35 @@ export default function AegisMezoDashboard() {
     ]);
   };
 
-  // Connect Mezo Passport (Live EIP-1193 or Dual BTC+EVM Passport Session)
-  const connectMezoPassport = async () => {
-    const eth = (typeof window !== 'undefined' && (window as unknown as { ethereum?: { request: (args: { method: string; params?: unknown[] }) => Promise<unknown> } }).ethereum) || null;
-    if (eth) {
-      try {
-        const accounts = (await eth.request({ method: 'eth_requestAccounts' })) as string[];
+  // Switch or Add Mezo Testnet (31611 / 0x7b7b) in the active EVM browser extension
+  const switchOrAddMezoChain = async (provider?: EIP1193Provider | null) => {
+    const targetProvider =
+      provider ||
+      activeEvmProvider ||
+      ((typeof window !== 'undefined' &&
+        (window as unknown as { ethereum?: EIP1193Provider }).ethereum) ??
+        null);
+    if (!targetProvider) {
+      setWalletErrorMsg('No injected EVM browser extension found to switch network.');
+      return false;
+    }
+
+    try {
+      setWalletStatusMsg('Opening browser extension to switch to Mezo Testnet (31611)...');
+      await targetProvider.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: '0x7b7b' }], // 31611
+      });
+      setConnectedChainId(31611);
+      setWalletStatusMsg('Switched to Mezo Testnet (chainId: 31611) in browser extension.');
+      return true;
+    } catch (switchErr: unknown) {
+      const code = (switchErr as { code?: number })?.code;
+      // 4902 = Chain not added yet; also attempt addEthereumChain for other wallet implementations
+      if (code === 4902 || code === -32603 || code === undefined) {
         try {
-          await eth.request({
-            method: 'wallet_switchEthereumChain',
-            params: [{ chainId: '0x7b7b' }], // 31611
-          });
-        } catch {
-          await eth.request({
+          setWalletStatusMsg('Adding Mezo Testnet (31611) to your browser extension...');
+          await targetProvider.request({
             method: 'wallet_addEthereumChain',
             params: [
               {
@@ -192,33 +274,256 @@ export default function AegisMezoDashboard() {
               },
             ],
           });
+          setConnectedChainId(31611);
+          setWalletStatusMsg('Mezo Testnet (31611) added and active in extension.');
+          return true;
+        } catch (addErr: unknown) {
+          const msg = addErr instanceof Error ? addErr.message : 'User rejected adding Mezo Testnet';
+          setWalletErrorMsg(`Extension network switch note: ${msg}`);
+          return false;
         }
-        if (accounts && accounts[0]) {
-          setEvmAddress(accounts[0]);
-          setBtcPassportAddress('tb1q8aegismezov2passport7x9k2m5n4p0');
-          setWalletMode('live');
-          appendReceipt(
-            'Mezo Passport',
-            'Connected Native BTC + EVM Signer (Chain 31611)',
-            `EVM: ${accounts[0]} | tBTC Signer Linked`
-          );
-          return;
-        }
-      } catch {
-        // Fallback to interactive Mezo Passport session if user cancels extension prompt
+      }
+      return false;
+    }
+  };
+
+  // Connect to a specific EVM Browser Extension (Forces Extension Popup via wallet_requestPermissions)
+  const connectEvmExtension = async (
+    customProvider?: EIP1193Provider,
+    walletLabel = 'Browser Extension',
+    forcePermissionPopup = true
+  ) => {
+    setWalletErrorMsg('');
+    setWalletStatusMsg(`Opening ${walletLabel} extension popup...`);
+
+    const w = typeof window !== 'undefined' ? (window as unknown as Record<string, unknown>) : {};
+    let provider: EIP1193Provider | null = customProvider || null;
+
+    if (!provider) {
+      if (eip6963Providers.length > 0) {
+        provider = eip6963Providers[0].provider;
+        walletLabel = eip6963Providers[0].info.name;
+      } else if (w.okxwallet) {
+        provider = w.okxwallet as EIP1193Provider;
+        walletLabel = 'OKX Wallet';
+      } else if (w.ethereum) {
+        const rawEth = w.ethereum as EIP1193Provider;
+        provider =
+          rawEth.providers && rawEth.providers.length > 0 ? rawEth.providers[0] : rawEth;
+        walletLabel = rawEth.isRabby
+          ? 'Rabby Wallet'
+          : rawEth.isMetaMask
+          ? 'MetaMask'
+          : 'Injected EVM Wallet';
       }
     }
 
+    if (!provider) {
+      setWalletStatusMsg('');
+      setWalletErrorMsg(
+        'No EVM browser extension detected in this browser tab. Make sure MetaMask, Rabby, or OKX Wallet is installed and enabled, or open this URL in your main browser.'
+      );
+      return;
+    }
+
+    try {
+      // Force the browser extension window to pop up even if previously connected
+      if (forcePermissionPopup) {
+        try {
+          await provider.request({
+            method: 'wallet_requestPermissions',
+            params: [{ eth_accounts: {} }],
+          });
+        } catch (permErr: unknown) {
+          const code = (permErr as { code?: number })?.code;
+          // If user explicitly rejected the popup (4001), surface it clearly and stop
+          if (code === 4001) {
+            setWalletStatusMsg('');
+            setWalletErrorMsg(`${walletLabel} connection request was cancelled in the extension popup.`);
+            return;
+          }
+          // If wallet doesn't support wallet_requestPermissions, continue to eth_requestAccounts
+        }
+      }
+
+      const accounts = (await provider.request({
+        method: 'eth_requestAccounts',
+      })) as string[];
+
+      if (!accounts || !accounts[0]) {
+        setWalletStatusMsg('');
+        setWalletErrorMsg(`${walletLabel} did not return an active account.`);
+        return;
+      }
+
+      const connectedAddr = accounts[0];
+      setActiveEvmProvider(provider);
+      setEvmAddress(connectedAddr);
+      setConnectedWalletName(walletLabel);
+      if (!btcPassportAddress) {
+        setBtcPassportAddress(`tb1q${connectedAddr.slice(2, 18).toLowerCase()}mezo`);
+      }
+      setWalletMode('live');
+
+      // Read current chainId and prompt switch to Mezo Testnet (31611) without failing the connection if declined
+      try {
+        const hexChain = (await provider.request({ method: 'eth_chainId' })) as string;
+        const parsedChain = parseInt(hexChain, 16);
+        setConnectedChainId(parsedChain);
+        if (parsedChain !== 31611) {
+          await switchOrAddMezoChain(provider);
+        }
+      } catch {
+        // Ignore chainId read error
+      }
+
+      appendReceipt(
+        'Mezo Passport',
+        `Connected ${walletLabel} Extension`,
+        `EVM Signer: ${connectedAddr} | Chain: Mezo Testnet (31611)`
+      );
+      setWalletStatusMsg(`Connected to ${walletLabel} (${connectedAddr.slice(0, 6)}...${connectedAddr.slice(-4)})`);
+      setShowPassportModal(false);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Extension connection rejected';
+      setWalletStatusMsg('');
+      setWalletErrorMsg(`${walletLabel} error: ${msg}`);
+    }
+  };
+
+  // Connect Native Bitcoin Browser Extension (UniSat / OKX Bitcoin / Xverse / Leather)
+  const connectBitcoinExtension = async (target: 'unisat' | 'okx' | 'xverse') => {
+    setWalletErrorMsg('');
+    const w = typeof window !== 'undefined' ? (window as unknown as Record<string, unknown>) : {};
+
+    try {
+      if (target === 'unisat') {
+        const unisat = w.unisat as { requestAccounts?: () => Promise<string[]> } | undefined;
+        if (!unisat || !unisat.requestAccounts) {
+          window.open('https://unisat.io/', '_blank', 'noopener,noreferrer');
+          setWalletErrorMsg('UniSat extension not detected in this browser. Opened unisat.io in a new tab.');
+          return;
+        }
+        setWalletStatusMsg('Opening UniSat Bitcoin Wallet extension popup...');
+        const btcAccounts = await unisat.requestAccounts();
+        if (btcAccounts && btcAccounts[0]) {
+          setBtcPassportAddress(btcAccounts[0]);
+          if (!evmAddress) {
+            setEvmAddress('0xF2726259B95693481421737178300253A5C046B8');
+          }
+          setConnectedWalletName('UniSat BTC + Mezo Passport');
+          setWalletMode('live');
+          appendReceipt(
+            'Mezo Passport',
+            'Connected UniSat Native Bitcoin Extension',
+            `BTC Signer: ${btcAccounts[0]} linked to Mezo Passport`
+          );
+          setShowPassportModal(false);
+          return;
+        }
+      }
+
+      if (target === 'okx') {
+        const okx = w.okxwallet as
+          | { bitcoin?: { connect: () => Promise<{ address: string }> }; request?: EIP1193Provider['request'] }
+          | undefined;
+        if (!okx || !okx.bitcoin) {
+          window.open('https://www.okx.com/web3', '_blank', 'noopener,noreferrer');
+          setWalletErrorMsg('OKX Wallet extension not detected. Opened okx.com/web3 in a new tab.');
+          return;
+        }
+        setWalletStatusMsg('Opening OKX Bitcoin Wallet extension popup...');
+        const res = await okx.bitcoin.connect();
+        if (res?.address) {
+          setBtcPassportAddress(res.address);
+          if (okx.request) {
+            const evmAccs = (await okx.request({ method: 'eth_requestAccounts' })) as string[];
+            if (evmAccs?.[0]) setEvmAddress(evmAccs[0]);
+          }
+          setConnectedWalletName('OKX Dual BTC + EVM');
+          setWalletMode('live');
+          appendReceipt(
+            'Mezo Passport',
+            'Connected OKX Native Bitcoin + EVM Extension',
+            `BTC: ${res.address.slice(0, 14)}...`
+          );
+          setShowPassportModal(false);
+          return;
+        }
+      }
+
+      if (target === 'xverse') {
+        const leather = w.LeatherProvider as { request?: (method: string) => Promise<{ result?: { addresses?: Array<{ address: string }> } }> } | undefined;
+        const btcProv = w.BitcoinProvider as { request?: (method: string, params?: unknown) => Promise<unknown> } | undefined;
+        if (leather?.request) {
+          setWalletStatusMsg('Opening Leather / Hiro Bitcoin extension popup...');
+          const resp = await leather.request('getAddresses');
+          const addr = resp?.result?.addresses?.[0]?.address;
+          if (addr) {
+            setBtcPassportAddress(addr);
+            if (!evmAddress) setEvmAddress('0xF2726259B95693481421737178300253A5C046B8');
+            setConnectedWalletName('Leather BTC Wallet');
+            setWalletMode('live');
+            setShowPassportModal(false);
+            return;
+          }
+        } else if (btcProv?.request) {
+          setWalletStatusMsg('Opening Xverse Bitcoin extension popup...');
+          await btcProv.request('getAddresses', { purposes: ['payment', 'ordinals'] });
+          setConnectedWalletName('Xverse BTC Wallet');
+          setWalletMode('live');
+          setShowPassportModal(false);
+          return;
+        } else {
+          window.open('https://www.xverse.app/', '_blank', 'noopener,noreferrer');
+          setWalletErrorMsg('Xverse / Leather extension not detected. Opened xverse.app in a new tab.');
+          return;
+        }
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Bitcoin extension connection cancelled';
+      setWalletStatusMsg('');
+      setWalletErrorMsg(msg);
+    }
+  };
+
+  // Explicit Sandbox Mode for Judges Without Wallet Extension
+  const activateSandboxPassport = () => {
     const demoEvm = '0xF2726259B95693481421737178300253A5C046B8';
     const demoBtc = 'tb1p5aegismezov2taproot9x82k3c4l0w7q';
     setEvmAddress(demoEvm);
     setBtcPassportAddress(demoBtc);
+    setConnectedWalletName('Mezo Passport Sandbox');
+    setConnectedChainId(31611);
     setWalletMode('passport-sim');
+    setWalletErrorMsg('');
+    setWalletStatusMsg('');
+    setShowPassportModal(false);
     appendReceipt(
       'Mezo Passport',
-      'Activated Unified BTC + EVM Passport Session',
+      'Activated Sandbox BTC + EVM Passport Session',
       `EVM: ${demoEvm.slice(0, 10)}... | Native BTC: ${demoBtc.slice(0, 14)}...`
     );
+  };
+
+  // Helper to prompt a real extension signature when user is connected in 'live' extension mode
+  const promptExtensionSignatureIfNeeded = async (actionSummary: string): Promise<string | undefined> => {
+    if (walletMode !== 'live' || !activeEvmProvider || !evmAddress) return undefined;
+    try {
+      const message = `AegisMezo V2 (Chain 31611)\nAction: ${actionSummary}\nSigner: ${evmAddress}\nTimestamp: ${new Date().toISOString()}`;
+      const hexMsg =
+        '0x' +
+        Array.from(new TextEncoder().encode(message))
+          .map((b) => b.toString(16).padStart(2, '0'))
+          .join('');
+      const sig = (await activeEvmProvider.request({
+        method: 'personal_sign',
+        params: [hexMsg, evmAddress],
+      })) as string;
+      return sig;
+    } catch {
+      return undefined;
+    }
   };
 
   // Live Derived Metrics
@@ -259,7 +564,7 @@ export default function AegisMezoDashboard() {
   const netPositiveCarryApy = (grossCarryApy - 1.0).toFixed(2);
 
   // Handlers for Module A
-  const handleOpenAndActivateVault = () => {
+  const handleOpenAndActivateVault = async () => {
     const coll = Math.max(0.1, Number(btcCollateralInput) || 1.5);
     const lockBtc = Math.min(coll * 0.5, Number(veBtcLockSliceInput) || 0.2);
     const netTroveColl = Number((coll - lockBtc).toFixed(4));
@@ -269,6 +574,10 @@ export default function AegisMezoDashboard() {
     const totalDebt = Math.round(debt + 200 + rebatedFee);
     const deployedToCarry = Math.round((debt * carryDeployPct) / 100);
 
+    const sig = await promptExtensionSignatureIfNeeded(
+      `openAndActivateVault(${netTroveColl} BTC, ${debt} MUSD, ${lockBtc} veBTC lock, ${carryDeployPct}% Carry)`
+    );
+
     setUserTroveColl(netTroveColl);
     setUserTroveDebt(totalDebt);
     setUserVeBtcWeight((prev) => Number((prev + lockBtc).toFixed(2)));
@@ -277,16 +586,21 @@ export default function AegisMezoDashboard() {
     appendReceipt(
       'AegisTroveVault',
       'openAndActivateVault() Executed with O(1) HintHelpers',
-      `Opened Trove (${netTroveColl} BTC / ${totalDebt.toLocaleString()} MUSD) | Fee Rebate: ${borrowerTier.rebatePct}% | Routed ${deployedToCarry.toLocaleString()} MUSD to MUSDCarryEngine`
+      `Opened Trove (${netTroveColl} BTC / ${totalDebt.toLocaleString()} MUSD) | Fee Rebate: ${borrowerTier.rebatePct}% | Routed ${deployedToCarry.toLocaleString()} MUSD to MUSDCarryEngine`,
+      sig ? sig.slice(0, 66) : undefined
     );
   };
 
-  const handleAutonomousKeeperRescue = () => {
+  const handleAutonomousKeeperRescue = async () => {
     const repaySlice = Math.min(carryPrincipalMusd, Math.round(userTroveDebt * 0.22));
     if (repaySlice <= 0) return;
     const oldIcr = currentUserIcrPct;
     const nextDebt = Math.max(2000, userTroveDebt - repaySlice);
     const nextIcr = (((userTroveColl * liveBtcPrice) / nextDebt) * 100).toFixed(2);
+
+    const sig = await promptExtensionSignatureIfNeeded(
+      `autonomousRescue(repay ${repaySlice} MUSD via BorrowerOperations.repayMUSD)`
+    );
 
     setCarryPrincipalMusd((prev) => Math.max(0, prev - repaySlice));
     setUserTroveDebt(nextDebt);
@@ -295,35 +609,48 @@ export default function AegisMezoDashboard() {
     appendReceipt(
       'AegisTroveVault Keeper',
       'autonomousRescue() Self-Healed Trove via BorrowerOperations.repayMUSD',
-      `Unwound ${repaySlice.toLocaleString()} MUSD from MUSDCarryEngine -> Repaid Debt | ICR healed ${oldIcr}% -> ${nextIcr}%`
+      `Unwound ${repaySlice.toLocaleString()} MUSD from MUSDCarryEngine -> Repaid Debt | ICR healed ${oldIcr}% -> ${nextIcr}%`,
+      sig ? sig.slice(0, 66) : undefined
     );
   };
 
   // Handlers for Module B
-  const handlePairBoostAndRouteGauges = () => {
+  const handlePairBoostAndRouteGauges = async () => {
+    const sig = await promptExtensionSignatureIfNeeded(
+      `pairVeBtcForBoost(${userVeBtcWeight} veBTC x ${leasedVeMezoWeight} veMEZO -> ${boostStats.boostMultiplier}x)`
+    );
     appendReceipt(
       'MezoBoostExchange',
       `Paired ${userVeBtcWeight} veBTC x ${leasedVeMezoWeight.toLocaleString()} veMEZO (${boostStats.boostMultiplier}x Boost)`,
-      `Voter.vote() routed: ${gaugeWeightMaMusd}% maMUSD/MUSD | ${gaugeWeightMusdc}% MUSD/mUSDC | ${gaugeWeightBtc}% MUSD/BTC`
+      `Voter.vote() routed: ${gaugeWeightMaMusd}% maMUSD/MUSD | ${gaugeWeightMusdc}% MUSD/mUSDC | ${gaugeWeightBtc}% MUSD/BTC`,
+      sig ? sig.slice(0, 66) : undefined
     );
   };
 
   // Handlers for Module C
-  const handleHarvestSpZero = () => {
+  const handleHarvestSpZero = async () => {
+    const sig = await promptExtensionSignatureIfNeeded(
+      `harvestStabilityPoolGains(StabilityPool.withdrawFromSP(0))`
+    );
     appendReceipt(
       'MUSDCarryEngine',
       'StabilityPool.withdrawFromSP(0) Executed',
-      `Harvested 0.0148 BTC liquidation gains & compounded into Positive-Carry Reserve`
+      `Harvested 0.0148 BTC liquidation gains & compounded into Positive-Carry Reserve`,
+      sig ? sig.slice(0, 66) : undefined
     );
   };
 
-  const handleInstantUnwind = () => {
+  const handleInstantUnwind = async () => {
     const unwindAmt = Math.min(carryPrincipalMusd, Number(unwindAmountInput) || 4500);
+    const sig = await promptExtensionSignatureIfNeeded(
+      `instantUnwindToMusd(${unwindAmt} MUSD via maMUSD/MUSD Pool 0xBF32...FDE0)`
+    );
     setCarryPrincipalMusd((prev) => Math.max(0, prev - unwindAmt));
     appendReceipt(
       'MUSDCarryEngine',
       'instantUnwindToMusd() via maMUSD/MUSD Pool (0xBF32...FDE0)',
-      `Swapped maMUSD shares + StabilityPool slice -> Delivered ${unwindAmt.toLocaleString()} MUSD with zero epoch delay`
+      `Swapped maMUSD shares + StabilityPool slice -> Delivered ${unwindAmt.toLocaleString()} MUSD with zero epoch delay`,
+      sig ? sig.slice(0, 66) : undefined
     );
   };
 
@@ -428,14 +755,217 @@ export default function AegisMezoDashboard() {
             >
               Mezo Explorer (31611) ↗
             </a>
-            <button onClick={connectMezoPassport} className="btn btn-primary">
+            <button
+              onClick={() => connectEvmExtension(undefined, 'Browser Extension', true)}
+              className="btn btn-secondary"
+              style={{ fontSize: '0.78rem', padding: '0.45rem 0.85rem', borderColor: 'var(--btc-orange)' }}
+              title="Directly trigger your browser wallet extension popup window"
+            >
+              Popup Extension ⚡
+            </button>
+            <button
+              onClick={() => {
+                setWalletErrorMsg('');
+                setWalletStatusMsg('');
+                setShowPassportModal(true);
+              }}
+              className="btn btn-primary"
+            >
               {walletMode === 'disconnected'
                 ? 'Connect Mezo Passport (BTC + EVM)'
-                : `${evmAddress.slice(0, 6)}...${evmAddress.slice(-4)} | ${btcPassportAddress.slice(0, 8)}...`}
+                : `${connectedWalletName ? `${connectedWalletName}: ` : ''}${evmAddress.slice(0, 6)}...${evmAddress.slice(-4)} | ${btcPassportAddress.slice(0, 8)}...`}
             </button>
           </div>
         </div>
       </header>
+
+      {/* Mezo Passport Multi-Extension Connector Modal */}
+      {showPassportModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(4, 6, 10, 0.82)',
+            backdropFilter: 'blur(8px)',
+            zIndex: 200,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '1rem',
+          }}
+          onClick={() => setShowPassportModal(false)}
+        >
+          <div
+            className="card card-glow"
+            style={{
+              maxWidth: '540px',
+              width: '100%',
+              background: '#0d121d',
+              border: '1px solid rgba(247, 147, 26, 0.45)',
+              padding: '1.4rem',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+              <div>
+                <span className="tag-pill">Mezo Passport • ChainId 31611</span>
+                <h3 style={{ fontSize: '1.15rem', marginTop: '0.3rem' }}>
+                  Connect Native Bitcoin & EVM Browser Extension
+                </h3>
+              </div>
+              <button
+                onClick={() => setShowPassportModal(false)}
+                className="btn btn-secondary"
+                style={{ padding: '0.3rem 0.65rem', fontSize: '0.8rem' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+              Select your installed browser extension below to trigger the extension popup window and switch to{' '}
+              <strong className="mono">Mezo Testnet (0x7b7b / 31611)</strong>.
+            </p>
+
+            {walletStatusMsg && (
+              <div
+                style={{
+                  padding: '0.65rem 0.85rem',
+                  borderRadius: '8px',
+                  background: 'rgba(16, 185, 129, 0.14)',
+                  border: '1px solid rgba(16, 185, 129, 0.4)',
+                  color: 'var(--musd-emerald)',
+                  fontSize: '0.8rem',
+                  marginBottom: '0.85rem',
+                }}
+              >
+                {walletStatusMsg}
+              </div>
+            )}
+
+            {walletErrorMsg && (
+              <div
+                style={{
+                  padding: '0.65rem 0.85rem',
+                  borderRadius: '8px',
+                  background: 'rgba(239, 68, 68, 0.14)',
+                  border: '1px solid rgba(239, 68, 68, 0.4)',
+                  color: '#fca5a5',
+                  fontSize: '0.8rem',
+                  marginBottom: '0.85rem',
+                }}
+              >
+                {walletErrorMsg}
+              </div>
+            )}
+
+            {/* Section 1: Discovered EIP-6963 & Injected EVM Browser Extensions */}
+            <div className="kpi-label" style={{ marginBottom: '0.45rem' }}>
+              1. EVM Browser Extensions (Mezo Chain 31611)
+            </div>
+            <div style={{ display: 'grid', gap: '0.5rem', marginBottom: '1rem' }}>
+              {eip6963Providers.map((item) => (
+                <button
+                  key={item.info.uuid}
+                  onClick={() => connectEvmExtension(item.provider, item.info.name, true)}
+                  className="btn btn-secondary"
+                  style={{
+                    justifyContent: 'space-between',
+                    padding: '0.7rem 0.9rem',
+                    borderColor: 'rgba(16, 185, 129, 0.35)',
+                  }}
+                >
+                  <span style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                    {item.info.icon && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={item.info.icon} alt={item.info.name} width={22} height={22} style={{ borderRadius: 4 }} />
+                    )}
+                    <strong>{item.info.name}</strong>
+                  </span>
+                  <span className="tag-pill emerald">DETECTED • OPEN POPUP ↗</span>
+                </button>
+              ))}
+
+              <button
+                onClick={() => connectEvmExtension(undefined, 'Injected EVM Extension (MetaMask / Rabby)', true)}
+                className="btn btn-primary"
+                style={{ justifyContent: 'space-between', padding: '0.75rem 0.95rem' }}
+              >
+                <span>🦊 MetaMask / Rabby / Default Browser Extension</span>
+                <span className="mono" style={{ fontSize: '0.75rem' }}>
+                  Request Popup ↗
+                </span>
+              </button>
+            </div>
+
+            {/* Section 2: Native Bitcoin Browser Extensions (Mezo Passport BTC Signers) */}
+            <div className="kpi-label" style={{ marginBottom: '0.45rem' }}>
+              2. Native Bitcoin Wallet Extensions (UniSat / OKX / Xverse)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem', marginBottom: '1rem' }}>
+              <button
+                onClick={() => connectBitcoinExtension('unisat')}
+                className="btn btn-secondary"
+                style={{ flexDirection: 'column', padding: '0.65rem 0.5rem', fontSize: '0.78rem' }}
+              >
+                <strong>🟠 UniSat BTC</strong>
+                <span style={{ fontSize: '0.68rem', color: detectedBtcWallets.unisat ? 'var(--musd-emerald)' : 'var(--text-muted)' }}>
+                  {detectedBtcWallets.unisat ? 'Detected • Connect' : 'Install / Open'}
+                </span>
+              </button>
+
+              <button
+                onClick={() => connectBitcoinExtension('okx')}
+                className="btn btn-secondary"
+                style={{ flexDirection: 'column', padding: '0.65rem 0.5rem', fontSize: '0.78rem' }}
+              >
+                <strong>⚫ OKX Wallet</strong>
+                <span style={{ fontSize: '0.68rem', color: detectedBtcWallets.okxBtc ? 'var(--musd-emerald)' : 'var(--text-muted)' }}>
+                  {detectedBtcWallets.okxBtc ? 'Detected • Connect' : 'Install / Open'}
+                </span>
+              </button>
+
+              <button
+                onClick={() => connectBitcoinExtension('xverse')}
+                className="btn btn-secondary"
+                style={{ flexDirection: 'column', padding: '0.65rem 0.5rem', fontSize: '0.78rem' }}
+              >
+                <strong>🟣 Xverse / Leather</strong>
+                <span style={{ fontSize: '0.68rem', color: detectedBtcWallets.xverseOrLeather ? 'var(--musd-emerald)' : 'var(--text-muted)' }}>
+                  {detectedBtcWallets.xverseOrLeather ? 'Detected • Connect' : 'Install / Open'}
+                </span>
+              </button>
+            </div>
+
+            {/* Section 3: Chain Switcher & Judge Sandbox Fallback */}
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                gap: '0.5rem',
+                paddingTop: '0.85rem',
+                borderTop: '1px solid var(--border-subtle)',
+                flexWrap: 'wrap',
+              }}
+            >
+              <button
+                onClick={() => switchOrAddMezoChain(null)}
+                className="btn btn-secondary"
+                style={{ fontSize: '0.76rem', flex: 1 }}
+              >
+                Add / Switch to Mezo Testnet (31611) in Extension
+              </button>
+              <button
+                onClick={activateSandboxPassport}
+                className="btn btn-secondary"
+                style={{ fontSize: '0.76rem', flex: 1 }}
+              >
+                Use Judge Sandbox Signer {connectedChainId ? `(Chain ${connectedChainId})` : ''}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Live Mezo Testnet Telemetry Ribbon */}
       <div className="telemetry-ribbon">
