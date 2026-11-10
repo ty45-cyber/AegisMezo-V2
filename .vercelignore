@@ -1,0 +1,10 @@
+# Foundry & Solidity build artifacts (not needed by Next.js on Vercel)
+lib/forge-std/
+cache/
+out/
+broadcast/
+test/
+script/
+node_modules/
+.next/
+.git/

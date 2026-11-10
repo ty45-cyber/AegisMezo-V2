@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Foundry build & cache
+cache/
+broadcast/
+
+# Environment & OS files
+.env
+.env.*
+.DS_Store
+Thumbs.db
